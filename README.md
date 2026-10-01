@@ -19,6 +19,32 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 252）。
 ./mvnw -q verify
 ```
 
+## 实现说明
+
+核心代码位于 `src/main/java/com/example/gsb/storage/`：
+
+- `BlockStorage`：底层块存储接口（`readBlock` / `writeBlock`）。
+- `CachedBlockStore`：块读缓存 + 预读组件，包装任意 `BlockStorage`。
+- `CacheStats`：统计快照（命中率、预读命中率、无效预读、底层读取次数等）。
+
+### 设计要点
+
+1. **按块读缓存与 LRU 淘汰**：使用容量可配置的 access-order LRU 映射，超过容量时淘汰最久未访问的块；被淘汰的预读块若从未被读请求消费，计为一次「无效预读」。
+2. **顺序模式识别（连续块命中次数）**：每次读请求都与上一次访问的块号比较，`blockId == prevBlockId + 1` 记为一次顺序步，维护「连续顺序步计数（streak）」；当 streak 达到阈值（默认 2，可配置）时判定为顺序扫描，异步预读后续 `depth` 个块。
+3. **预读深度动态调整**：另维护最近 32 次访问的滑动窗口，按其中顺序步占比计算深度
+   `depth = round(maxPrefetchDepth × 顺序占比)`。顺序扫描时深度迅速升到最大值；随机访问时深度降到 0，不再产生无效预读。可用 `setPrefetchEnabled(false)` 运行时关闭预读，`getCurrentPrefetchDepth()` 可观察当前深度。
+4. **缓存一致性**：`writeBlock`（写穿）与 `invalidate`（带外更新后手动失效）都会删除缓存项并递增该块版本号；进行中的底层读取在发起前记录版本，完成后若版本已变（期间发生过更新）则丢弃结果，保证旧数据不会进入缓存。
+5. **并发去重**：同一块的并发请求共享一个 in-flight `CompletableFuture`，只有第一个请求真正触发底层读取，其余请求阻塞等待并复用结果；预读与读请求之间同样去重。
+6. **统计**：`getStats()` 返回命中率（命中=缓存命中或复用 in-flight 读取）、预读命中率（预读块被实际消费的比例）、无效预读数、底层读取次数、淘汰数与失效数。
+
+### 性能对比
+
+`PerformanceComparisonTest` 在模拟 3 ms/块延迟的底层存储上跑 120 次读取，结果同时打印到控制台并写入 `target/perf-comparison.txt`。典型结果：顺序扫描开启预读约 6 倍加速；随机访问因自适应深度降为 0，开关预读耗时基本一致且无无效预读。
+
+### 测试覆盖
+
+`CachedBlockStoreTest`（8 个）：缓存命中与 LRU 淘汰、顺序预读生效、预读开关、深度随随机/顺序模式自适应、写失效不读旧数据、进行中的过期预读被丢弃、同块并发只读一次、无效预读计数；`PerformanceComparisonTest`（1 个）：顺序/随机 × 预读开/关注耗时对比并断言顺序加速、随机无浪费。
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。

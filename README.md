@@ -19,6 +19,36 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 252）。
 ./mvnw -q verify
 ```
 
+## 组件设计说明
+
+实现位于 `src/main/java/com/example/gsb/cache/`：
+
+- `BlockStore`：按块寻址的存储抽象（`blockSize` / `blockCount` / `readBlock` / `writeBlock`）。
+- `LatencyBlockStore`：内存模拟的慢速底层设备，每次读取注入固定延迟并统计底层读取次数。
+- `CachedBlockStore`：核心装饰器，叠加读缓存、顺序预读、并发去重与统计。
+- `CacheStats`：命中率、预读命中率、无效预读数、底层读取次数等统计快照。
+
+### 关键机制
+
+1. **读缓存**：access-order `LinkedHashMap` 实现 LRU，容量构造时可配，超出容量淘汰最久未访问块。
+2. **顺序模式识别**：当前访问块号 == 上次访问块号 +1 时，连续步进计数 `streak` 加一，
+   否则清零；`streak` 达到 `sequentialThreshold`（默认 2）即判定为顺序流，对后续
+   `depth` 个块注册异步预读。每次顺序访问（含缓存命中）都会重新推进预读窗口，保持流水线预热。
+3. **动态预读**：`setReadaheadEnabled` 开关预读；深度按窗口自适应——每 `adjustmentWindow`
+   次预读观察（预读命中 + 无效预读）评估一次，有效率 >= 60% 加深（上限 `maxDepth`），
+   <= 30% 减半（下限 `minDepth`）。随机访问下 `streak` 难以达到阈值，几乎不触发预读，
+   偶发预读若大多无效，深度也会被自动压低。
+4. **一致性**：`writeBlock` 写穿底层并使对应缓存失效；每次加载携带块版本号，
+   失效前发起的在途读取完成后因版本不匹配被丢弃，旧数据不会写回缓存。
+5. **并发去重**：预读在触发时同步把 `Load`（含 `CompletableFuture`）注册进 in-flight 表，
+   实际读取异步执行；同一块的并发需求读与重复预读永远共享同一次底层读取。
+6. **统计**：`stats()` 返回 `CacheStats` 快照（命中率 / 预读命中率 / 无效预读数 / 底层读取次数）。
+
+### 性能对比
+
+`PerformanceComparisonTest` 在 2ms 注入延迟、256 次请求下输出对比表（`mvn verify` 可见）：
+顺序模式预读开启约提速 2.5x 以上；随机模式预读开关耗时接近（顺序检测不成立，几乎不产生无效预读）。
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
